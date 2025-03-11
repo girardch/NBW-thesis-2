@@ -1,0 +1,1189 @@
+---
+title: "final thesis code"
+output: html_document
+date: "2025-03-11"
+---
+
+```{r}
+
+
+# Load necessary libraries
+library(readxl)
+library(data.table)
+#install.packages("here")
+library(here)
+
+library(readxl)
+Master <- as.data.table(read_excel("C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/Master.xlsx"))
+
+# Load dataset using a relative path
+#Master <- as.data.table(read_excel(here("data", "Master.xlsx")))
+
+
+# Check if 'Title' exists in the dataset
+if (!"Title" %in% colnames(Master)) {
+  stop("The 'Title' column is missing from the dataset.")
+}
+
+# Remove rows with titles containing "unk" or "see crops"
+Master <- Master[!grepl("unk|see crops", Title, ignore.case = TRUE)]
+
+# Extract 'Sex', 'Age_Class', and 'Year' from the dataset
+Master[, Sex := ifelse(grepl("FemaleJ", Keyword.export, ignore.case = TRUE), "FemaleJ", 
+                       ifelse(grepl("Male", Keyword.export, ignore.case = TRUE), "Male", 
+                              ifelse(grepl("Female", Keyword.export, ignore.case = TRUE), "Female", NA)))]  # Ensure "FemaleJ" is checked first
+
+Master[, Age_Class := ifelse(grepl("Calf", Keyword.export, ignore.case = TRUE), "Calf", 
+                             ifelse(grepl("juv", Keyword.export, ignore.case = TRUE), "Juvenile", 
+                                    ifelse(grepl("juv/calf", Keyword.export, ignore.case = TRUE), "Juvenile/Calf", 
+                                           "Adult")))]  # Default to "Adult"
+
+# Extract year and date
+Master[, Year := as.numeric(substr(Date.Original, 1, 4))]
+Master[, Date := as.Date(Date.Original)]  # Convert Date.Original to Date for grouping
+
+# Function to build binary association data with time-based associations
+build_binary_association_data_master <- function(master) {
+  master <- as.data.table(master)  # Ensure master is a data.table
+  
+  # Generate all dyads
+  dyads <- data.table(t(combn(master[, unique(Title)], 2)))  # Generate all dyads
+  colnames(dyads) <- c('A', 'B')
+  
+  # Initialize empty data table for results
+  df <- data.table(A = character(), B = character(), sampling_day = as.Date(NA),
+                   A_observed = integer(), B_observed = integer(),
+                   A_sex = character(), B_sex = character(),
+                   A_age_class = character(), B_age_class = character(),
+                   association = integer())
+  
+  # Loop through unique dates
+  for (d in unique(master$Date)) { 
+    temp <- copy(dyads)
+    temp[, sampling_day := d]  # Add date column
+    
+    # Filter data for the current day
+    day_data <- master[Date == d]
+    
+    # Use %in% to check membership
+    temp[, A_observed := ifelse(A %in% day_data$Title, 1, 0)]
+    temp[, B_observed := ifelse(B %in% day_data$Title, 1, 0)]
+    
+    # Prune rows where neither member of the dyad was observed
+    temp <- temp[A_observed == 1 | B_observed == 1]
+    
+    # Remove self-self comparisons
+    temp <- temp[A != B]
+    
+    # Add Sex and Age Class for individuals
+    temp[, A_sex := day_data[Title == A, unique(Sex)][1], by = .(A)]
+    temp[, B_sex := day_data[Title == B, unique(Sex)][1], by = .(B)]
+    temp[, A_age_class := day_data[Title == A, unique(Age_Class)][1], by = .(A)]
+    temp[, B_age_class := day_data[Title == B, unique(Age_Class)][1], by = .(B)]
+    
+    # Determine association based on 10-minute time window
+    temp[, association := ifelse(A_observed == 1 & B_observed == 1, {
+      A_times <- day_data[Title == A, Date.Original]
+      B_times <- day_data[Title == B, Date.Original]
+      
+      # Check if timestamps are within 10 minutes
+      if (length(A_times) > 0 & length(B_times) > 0) {
+        any(abs(outer(as.numeric(A_times), as.numeric(B_times), `-`)) <= 600)  # 600 seconds = 10 minutes
+      } else {
+        0
+      }
+    }, 0), by = .(A, B)]
+    
+    # Append results
+    df <- rbindlist(list(df, temp), fill = TRUE)
+  }
+  
+  # Add additional columns
+  df[, index := .I]  # Add index
+  df[, bothPresent := ifelse((A_observed == 1 & B_observed == 1), 1, 0)]  # Indicate both present
+  df[, dyad := paste(pmin(A, B), pmax(A, B), sep = '_'), by = .(A, B)]  # Create unique dyad name
+  
+  return(df)
+}
+
+# Process data for each year in the dataset
+all_years_results <- list()
+
+for (year in unique(Master$Year)) {
+  Master_year <- Master[Year == year]
+  result_year <- build_binary_association_data_master(Master_year)
+  all_years_results[[as.character(year)]] <- result_year
+}
+
+# Combine all results into a single data.table
+final_results_3 <- rbindlist(all_years_results, idcol = "Year")
+
+# View the combined result
+print(final_results_3)
+
+# Save the combined result as a CSV file
+write.csv(final_results_3, "final_results_3.csv", row.names = FALSE)
+```
+
+
+ADDED MEASURES FOR CENTRALITY-DEGREE AND BETWEENESS TO TABLE
+FIXED HWI FOR DYAD PER YEAR
+```{r}
+library(igraph)
+library(data.table)
+library(ggplot2)
+
+# Ensure final_results_3 is a data.table
+final_results_3 <- as.data.table(final_results_3)
+
+# Step 1: Calculate HWI for Dyads
+# Compute HWI based on dyad associations
+hwi_results <- final_results_3[, .(
+  x = sum(association, na.rm = TRUE),     # Times A and B were observed together
+  Ya = sum(A_observed, na.rm = TRUE),    # Times A was observed
+  Yb = sum(B_observed, na.rm = TRUE)     # Times B was observed
+), by = .(Year, dyad)]
+
+# Include all HWI values, including zeros
+hwi_results[, HWI := x / (x + 0.5 * (Ya + Yb - 2 * x))]
+
+# Filter out edges with non-positive HWI values for network construction
+hwi_filtered <- hwi_results[HWI > 0]
+
+# Retain all HWI values for histogram analysis
+write.csv(hwi_results, "C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/full_aggregated_HWI.csv", row.names = FALSE)
+
+# Plot a histogram of the HWI values
+ggplot(hwi_results, aes(x = HWI)) +
+  geom_histogram(binwidth = 0.05, fill = "blue", color = "black", alpha = 0.7) +
+  labs(
+    title = "Histogram of Half-Weight Index (HWI)",
+    x = "HWI Values",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+# Save the histogram plot as an image
+ggsave(
+  "C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/hwi_histogram.png",
+  width = 10,
+  height = 6
+)
+
+# Step 2: Split Dyads for Network Building
+hwi_filtered[, c("Node_A", "Node_B") := tstrsplit(dyad, "_")]
+
+# Step 3: Build Social Networks
+social_networks <- list()
+
+for (year in unique(hwi_filtered$Year)) {
+  # Filter data for the current year
+  year_edges <- hwi_filtered[Year == year]
+
+  # Create an igraph object with edges and weights
+  g <- graph_from_data_frame(
+    d = year_edges[, .(Node_A, Node_B, weight = HWI)],  # Use HWI as edge weights
+    directed = FALSE
+  )
+  
+  # Ensure edge weights are positive
+  E(g)$weight <- abs(E(g)$weight)
+
+  # Calculate nodal metrics for each node in the network
+  V(g)$strength <- strength(g, mode = "all", weights = E(g)$weight)
+  V(g)$degree <- degree(g, mode = "all")
+  V(g)$betweenness <- betweenness(g, weights = E(g)$weight, normalized = TRUE)
+  V(g)$eigenvector <- eigen_centrality(g, weights = E(g)$weight)$vector
+  
+  # Store the graph in the list
+  social_networks[[as.character(year)]] <- g
+  
+  # Step 4: Visualize the Network
+  png(paste0("C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/network_", year, ".png"), width = 800, height = 800)
+  plot(
+    g,
+    edge.width = E(g)$weight * 10,                       # Scale edge width by HWI
+    vertex.size = V(g)$strength / max(V(g)$strength) * 30,  # Scale vertex size by strength
+    vertex.label.cex = 0.8,                              # Adjust label size
+    main = paste("Social Network for Year", year)
+  )
+  dev.off()
+}
+
+# Step 5: Save the Network Graphs
+saveRDS(social_networks, "C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/social_networks.rds")
+
+# Step 6: Create a Table for Nodal Metrics
+network_metrics <- rbindlist(lapply(names(social_networks), function(year) {
+  g <- social_networks[[year]]
+  data.table(
+    Year = year,
+    Node = V(g)$name,
+    Strength = V(g)$strength,
+    Degree = V(g)$degree,
+    Betweenness = V(g)$betweenness,
+    Eigenvector = V(g)$eigenvector
+  )
+}))
+
+# Save the nodal metrics table
+write.csv(network_metrics, "C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/nodal_metrics.csv", row.names = FALSE)
+
+# Save Dyadic HWI Table
+write.csv(hwi_filtered, "C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/aggregated_HWI.csv", row.names = FALSE)
+
+# View Results
+print("HWI Results:")
+print(head(hwi_filtered, 20))
+
+print("Nodal Metrics:")
+print(head(network_metrics, 20))
+
+```
+
+
+```{r}
+library(igraph)
+library(data.table)
+
+# Ensure final_results_3 is a data.table
+final_results_3 <- as.data.table(final_results_3)
+
+# Step 1: Calculate HWI for Dyads
+# Compute HWI based on dyad associations
+hwi_results <- final_results_3[, .(
+  x = sum(association, na.rm = TRUE),     # Times A and B were observed together
+  Ya = sum(A_observed, na.rm = TRUE),    # Times A was observed
+  Yb = sum(B_observed, na.rm = TRUE)     # Times B was observed
+), by = .(Year, dyad)]  # Group by Year and dyad
+
+hwi_results[, HWI := x / (x + 0.5 * (Ya + Yb - 2 * x))]  # Calculate HWI
+hwi_results <- hwi_results[HWI > 0]  # Remove dyads with non-positive HWI
+
+# Step 2: Split Dyads for Network Building
+hwi_results[, c("Node_A", "Node_B") := tstrsplit(dyad, "_")]
+
+# Step 3: Build Social Networks and Calculate Nodal Metrics
+social_networks <- list()
+network_results <- list()
+
+for (year in unique(hwi_results$Year)) {
+  # Filter data for the current year
+  year_edges <- hwi_results[Year == year]
+
+  # Create an igraph object with edges and weights
+  g <- graph_from_data_frame(
+    d = year_edges[, .(Node_A, Node_B, weight = HWI)],  # Use HWI as edge weights
+    directed = FALSE
+  )
+  
+  # Calculate nodal metrics for each node in the network
+  V(g)$strength <- strength(g, mode = "all", weights = E(g)$weight)
+  V(g)$degree <- degree(g, mode = "all")
+  V(g)$betweenness <- betweenness(g, weights = E(g)$weight, normalized = TRUE)
+  V(g)$eigenvector <- eigen_centrality(g, weights = E(g)$weight)$vector
+  
+  # Store the graph in the list
+  social_networks[[as.character(year)]] <- g
+
+  # Combine nodal metrics into a data.table for individual nodes
+  node_data <- data.table(
+    Year = year,
+    Node = V(g)$name,
+    Strength = V(g)$strength,
+    Degree = V(g)$degree,
+    Betweenness = V(g)$betweenness,
+    Eigenvector = V(g)$eigenvector
+  )
+  
+  # Add nodal metrics to results list
+  network_results[[as.character(year)]] <- node_data
+
+  # Step 4: Visualize the Network
+  png(paste0("C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/network_", year, ".png"), width = 800, height = 800)
+  plot(
+    g,
+    edge.width = E(g)$weight * 10,                       # Scale edge width by HWI
+    vertex.size = V(g)$strength / max(V(g)$strength) * 30,  # Scale vertex size by strength
+    vertex.label.cex = 0.8,                              # Adjust label size
+    main = paste("Social Network for Year", year)
+  )
+  dev.off()
+}
+
+# Step 5: Save Results
+# Combine nodal metrics across years
+network_metrics <- rbindlist(network_results)
+
+# Save nodal metrics table
+write.csv(network_metrics, "C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/nodal_metrics.csv", row.names = FALSE)
+
+# Save HWI data table
+write.csv(hwi_results, "C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/aggregated_HWI.csv", row.names = FALSE)
+
+# Save social network graphs
+saveRDS(social_networks, "C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/social_networks.rds")
+
+# Step 6: View Results
+print("HWI Results:")
+print(head(hwi_results, 20))
+
+print("Nodal Metrics:")
+print(head(network_metrics, 20))
+
+
+```
+
+```{r}
+# Load necessary library
+library(data.table)
+
+# Convert final_results_3 to a data.table if not already
+setDT(final_results_3)
+
+# Extract individuals from column A
+ID_sex_age_A <- final_results_3[, .(Year, Individual = A, Sex = A_sex, Age_Class = A_age_class)]
+
+# Extract individuals from column B
+ID_sex_age_B <- final_results_3[, .(Year, Individual = B, Sex = B_sex, Age_Class = B_age_class)]
+
+# Combine both sets of individuals
+ID_sex_age <- rbind(ID_sex_age_A, ID_sex_age_B)
+
+# Remove duplicates to keep unique (Individual, Year) pairs
+ID_sex_age <- unique(ID_sex_age, by = c("Year", "Individual"))
+
+# View the dataset
+print(ID_sex_age)
+
+# Save the dataset
+write.csv(ID_sex_age, "ID_sex_age.csv", row.names = FALSE)
+
+
+
+```
+
+
+
+building the social network
+```{r}
+library(igraph)
+
+# Ensure `nodal_metrics_individual`, `hwi_metrics_dyad`, and `ID_sex_age` are loaded
+nodal_metrics <- network_metrics  # Replace with your actual table name
+edges_data <- hwi_results         # Replace with your dyadic HWI table
+ID_sex_age <- ID_sex_age   # Table containing age class information
+
+# Initialize a list to store networks
+social_networks <- list()
+
+# Loop through each year to build networks
+for (year in unique(nodal_metrics$Year)) {
+  # Filter node data for the current year
+  year_nodes <- nodal_metrics[Year == year]
+  
+  # Add age class information to the nodes
+  year_nodes <- merge(
+    year_nodes, 
+    ID_sex_age[, .(Node = Individual, age_class = Age_Class)], 
+    by = "Node", 
+    all.x = TRUE
+  )
+  
+  # Ensure unique nodes
+  year_nodes <- unique(year_nodes, by = "Node")
+  
+  # Filter edge data for the current year
+  year_edges <- edges_data[Year == year]
+  
+  # Split dyads into two columns (Node_A and Node_B)
+  year_edges[, c("Node_A", "Node_B") := tstrsplit(dyad, "_")]
+  
+  # Ensure all edges refer to nodes present in year_nodes
+  year_edges <- year_edges[
+    Node_A %in% year_nodes$Node & Node_B %in% year_nodes$Node
+  ]
+  
+  # Create a network graph using edges and nodes
+  g <- graph_from_data_frame(
+    d = year_edges[, .(Node_A, Node_B, weight = HWI)],  # Use HWI as edge weights
+    vertices = year_nodes[, .(Node, strength = Strength, degree = Degree, betweenness = Betweenness, age_class)],  # Node attributes
+    directed = FALSE
+  )
+  
+  # Assign colors based on age class
+  V(g)$color <- ifelse(
+    V(g)$age_class == "Calf", "purple",
+    ifelse(V(g)$age_class == "Juvenile", "darkblue", "gray")  # Default to gray for other classes
+  )
+  
+  # Store the network graph
+  social_networks[[as.character(year)]] <- g
+  
+  # Visualize the network
+  plot(
+    g,
+    edge.width = E(g)$weight * 10,              # Scale edge width by HWI
+    vertex.size = V(g)$strength / max(V(g)$strength) * 15,  # Increased scaling factor for slightly larger nodes
+    vertex.label = NA,                          # Remove vertex labels
+    vertex.color = V(g)$color,                  # Color nodes by age class
+    main = paste("Social Network for Year", year)
+  )
+  
+  # Save the graph as a PNG file (optional)
+  png(paste0("C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/network_", year, ".png"), width = 800, height = 800)
+  plot(
+    g,
+    edge.width = E(g)$weight * 10,
+    vertex.size = V(g)$strength / max(V(g)$strength) * 15,  # Increased scaling factor for slightly larger nodes
+    vertex.label = NA,
+    vertex.color = V(g)$color,
+    main = paste("Social Network for Year", year)
+  )
+  dev.off()
+}
+
+# Save all networks for further analysis
+saveRDS(social_networks, "C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/social_networks.rds")
+
+
+# Check if the 2021 network exists and plot it
+if ("2021" %in% names(social_networks)) {
+  # Extract the 2021 social network
+  g_2021 <- social_networks[["2021"]]
+  
+  # Save as a PDF file
+  pdf("C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/social_network_2021.pdf", width = 10, height = 10)
+  plot(
+    g_2021,
+    edge.width = E(g_2021)$weight * 10,              # Scale edge width by HWI
+    vertex.size = V(g_2021)$strength / max(V(g_2021)$strength) * 15,  # Scale vertex size
+    vertex.label = NA,                              # Remove vertex labels
+    vertex.color = V(g_2021)$color,                 # Color nodes by age class
+    main = "Social Network for Year 2021"
+  )
+  dev.off()
+  
+  # Optionally, save as a PNG file
+  png("C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/social_network_2021.png", width = 1000, height = 1000, res = 400)
+  plot(
+    g_2021,
+    edge.width = E(g_2021)$weight * 10,
+    vertex.size = V(g_2021)$strength / max(V(g_2021)$strength) * 15,
+    vertex.label = NA,
+    vertex.color = V(g_2021)$color,
+    main = "Social Network for Year 2021"
+  )
+  dev.off()
+  
+  cat("Plot for the 2021 social network saved successfully.\n")
+} else {
+  warning("The 2021 social network does not exist in the dataset.")
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+dataset for first glm
+
+```{r}
+# Add dyadic age and sex columns
+final_results_4 <- copy(final_results_3)  # Create a copy to preserve final_results_3
+
+
+
+# Create dyadic_age column (e.g., Adult_Adult)
+final_results_4[, dyadic_age := paste(
+  pmin(A_age_class, B_age_class), 
+  pmax(A_age_class, B_age_class), 
+  sep = "_"
+), by = .(A, B)]
+
+# Create dyadic_sex column (e.g., Male_Male)
+final_results_4[, dyadic_sex := paste(
+  pmin(A_sex, B_sex), 
+  pmax(A_sex, B_sex), 
+  sep = "_"
+), by = .(A, B)]
+
+# Summing observations for each dyad
+final_results_4[, x := sum(association, na.rm = TRUE), by = .(dyad)]  # Times A and B observed together
+final_results_4[, Ya := sum(A_observed, na.rm = TRUE), by = .(dyad)]  # Times A observed
+
+
+final_results_4[, Yb := sum(B_observed, na.rm = TRUE), by = .(dyad)]  # Times B observed
+
+# Calculate HWI for each dyad
+final_results_4[, HWI := x / (x + 0.5 * (Ya + Yb - 2 * x)), by = .(dyad)]
+
+# View the updated table
+print(final_results_4)
+
+# Save the updated result as a CSV file
+write.csv(final_results_4, "final_results_4_with_HWI.csv", row.names = FALSE)
+
+```
+
+updating the data table to ensure one row per dyad per year
+
+```{r}
+
+# Load necessary libraries
+library(data.table)
+
+# Ensure final_results_4 is a data.table
+setDT(final_results_4)
+
+# Step 1: Modify final_results_4 to ensure one row per dyad per year
+final_results_4_agg <- final_results_4[, .(
+  x = sum(association, na.rm = TRUE),      # Count number of times A & B seen together in that year
+  Ya = sum(A_observed, na.rm = TRUE),      # Count number of times A was seen in that year
+  Yb = sum(B_observed, na.rm = TRUE)       # Count number of times B was seen in that year
+), by = .(dyad, A, B, Year, dyadic_age, dyadic_sex)]
+
+# Step 2: Calculate Half-Weight Index (HWI) per dyad per year
+final_results_4_agg[, denominator := (x + 0.5 * (Ya + Yb - 2 * x))]
+final_results_4_agg[, HWI := ifelse(denominator > 0, x / denominator, NA)]  # Avoid division errors
+
+# Step 3: Remove missing and zero HWI values
+final_results_4_agg <- final_results_4_agg[!is.na(HWI) & HWI > 0]
+
+# Save the aggregated result
+write.csv(final_results_4_agg, "final_results_4_aggregated.csv", row.names = FALSE)
+
+print("Final Results Aggregated - One Row Per Dyad Per Year:")
+print(head(final_results_4_agg, 10))
+
+
+
+```
+
+restrict to pairs where opportunities seen greater than 3
+-removed this restriction? because there is only one row for each dyad
+
+first glm final excluding sex
+
+```{r}
+# Load necessary libraries
+library(glmmTMB)
+library(ggplot2)
+
+# Convert categorical variables to factors
+setDT(final_results_4_agg)
+final_results_4_agg[, dyadic_age := as.factor(dyadic_age)]
+final_results_4_agg[, Year := as.factor(Year)]
+final_results_4_agg[, A := as.factor(A)]
+final_results_4_agg[, B := as.factor(B)]
+
+# Filter out invalid rows
+glm_data <- final_results_4_agg[
+  !is.na(HWI) & !is.na(dyadic_age) & !is.na(Year) & dyadic_age != "NA_NA"
+]
+
+# Aggregate HWI to ensure **one row per dyad per year**
+glm_data <- glm_data[, .(
+  edge = mean(HWI, na.rm = TRUE)  # Use mean HWI per dyad per year
+), by = .(A, B, Year, dyadic_age)]
+
+# Adjust edge values to avoid issues in beta regression
+epsilon <- 1e-6  
+glm_data[edge == 1, edge := 1 - epsilon]  
+glm_data[edge == 0, edge := 0 + epsilon]  
+
+# Fit the mixed-effects beta regression model with only dyadic age combinations
+glm_model_55 <- glmmTMB(
+  edge ~ dyadic_age + (1 | A) + (1 | B) + (1 | Year),
+  data = glm_data,
+  family = beta_family()
+)
+
+# Summarize the model
+summary(glm_model_55)
+
+# Save the model
+saveRDS(glm_model_55, "glm_model_5_edge_beta_age_only.rds")
+
+```
+
+```{r}
+
+library(sjPlot)
+set_theme(
+  base = theme_minimal() +
+    theme(panel.grid = element_blank())
+)
+
+
+
+library(sjPlot)
+library(ggplot2)
+library(scales)
+
+# Generate the prediction plot using plot_model() with your desired settings.
+# (The ci.linetype argument might not work as expected on its own.)
+sj_glm_1 <- plot_model(
+  glm_model_55, 
+  type = "pred", 
+  jitter = TRUE, 
+  show.data = TRUE, 
+  dot.size = 4, 
+  ci.lwd = 1.5, 
+  ci.linetype = "solid"
+)
+
+
+  
+  # Remove the x-axis title and overall plot title, and set the y-axis label.
+  sj_glm_1 <- sj_glm_1 + 
+    labs(x = NULL, y = "HWI (Strength)") +
+    theme(
+      plot.title = element_blank(),
+      panel.grid = element_blank()
+    ) +
+    scale_y_continuous(limits = c(0, 1), oob = squish)
+  
+  print(sj_glm_1)
+
+
+
+
+```
+
+data for glm 2
+
+```{r}
+
+# Load the dataset as a data.table
+#Master <- as.data.table(read_excel("C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/Master.xlsx"))
+
+# Check if 'Title' exists in the dataset
+if (!"Title" %in% colnames(Master)) {
+  stop("The 'Title' column is missing from the dataset.")
+}
+
+# Remove rows with titles containing "unk" or "see crops"
+Master <- Master[!grepl("unk|see crops", Title, ignore.case = TRUE)]
+
+# Extract 'Sex', 'Age_Class', and 'Year' from the dataset
+Master[, Sex := ifelse(grepl("FemaleJ", Keyword.export, ignore.case = TRUE), "FemaleJ", 
+                       ifelse(grepl("Male", Keyword.export, ignore.case = TRUE), "Male", 
+                              ifelse(grepl("Female", Keyword.export, ignore.case = TRUE), "Female", NA)))]  # Ensure "FemaleJ" is checked first
+
+Master[, Age_Class := ifelse(grepl("Calf", Keyword.export, ignore.case = TRUE), "Calf", 
+                             ifelse(grepl("juv", Keyword.export, ignore.case = TRUE), "Juvenile", 
+                                    ifelse(grepl("juv/calf", Keyword.export, ignore.case = TRUE), "Juvenile/Calf", 
+                                           "Adult")))]  # Default to "Adult"
+
+# Extract year from `Date.Original`
+Master[, Year := as.numeric(substr(Date.Original, 1, 4))]
+
+# Ensure each unique Title appears only once per Year
+Master <- Master[order(Year, Title)]  # Sort by Year and Title
+Master <- Master[, .SD[1], by = .(Year, Title)]  # Retain the first occurrence of each Title per Year
+
+# Create the ID_sex_age data frame with the year column
+ID_sex_age <- unique(Master[, .(Title, Sex, Age_Class, Year)])
+
+# View the ID_sex_age data frame
+print(ID_sex_age)
+
+# Save the ID_sex_age data frame as a CSV file
+write.csv(ID_sex_age, "ID_sex_age_with_year.csv", row.names = FALSE)
+
+
+```
+
+merging network metrics and ID_sex_age
+
+```{r}
+
+# Ensure the `Year` column is consistently a character type in both tables
+network_metrics[, Year := as.character(as.integer(Year))]  # Convert to integer first to remove decimals, then to character
+ID_sex_age[, Year := as.character(as.integer(Year))]       # Do the same for ID_sex_age
+
+# Ensure unique entries in ID_sex_age for each Title-Year combination
+ID_sex_age_unique <- ID_sex_age[!duplicated(ID_sex_age, by = c("Title", "Year"))]
+
+# Merge network_metrics with ID_sex_age_unique based on Node (Title) and Year
+merged_table <- merge(
+  network_metrics,
+  ID_sex_age_unique,
+  by.x = c("Node", "Year"),
+  by.y = c("Title", "Year"),
+  all.x = TRUE
+)
+
+# Select and reorder the desired columns
+final_table <- merged_table[, .(
+  Year,
+  Title = Node,  # Rename Node to Title for clarity
+  Sex,
+  Age_Class,
+  Strength,
+  Degree,
+  Betweenness,
+  Eigenvector
+)]
+
+# View the final table
+print(final_table)
+
+# Save the final table to a CSV file
+write.csv(final_table, "final_merged_table.csv", row.names = FALSE)
+
+```
+
+```{r}
+library(readxl)
+library(data.table)
+library(lubridate)  # for the year() function
+
+# Load the dataset
+Master <- as.data.table(read_excel("C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/Master.xlsx"))
+
+# Check if 'Title' exists
+if (!"Title" %in% colnames(Master)) {
+  stop("The 'Title' column is missing from the dataset.")
+}
+
+# Remove rows with titles containing "unk" or "see crops"
+Master <- Master[!grepl("unk|see crops", Title, ignore.case = TRUE)]
+
+# Convert Date.Original to a proper Date
+Master[, Date := as.IDate(Date.Original, format = "%Y-%m-%d")]
+
+# Extract year using lubridate's year() function
+Master[, year := year(Date)]
+
+# Remove rows with missing values in key columns
+Master <- Master[!is.na(Title) & !is.na(year) & !is.na(Date)]
+
+# Calculate the number of unique days per Title and year
+Master[, numDaysByYear := uniqueN(Date), by = .(Title, year)]
+
+# Extract unique combinations to create the sampling_period data frame
+sampling_period <- unique(Master[, .(Title, year, numDaysByYear)])
+
+# View the result
+print(sampling_period)
+
+# Save to CSV (optional)
+write.csv(sampling_period, "C:/Users/balae/OneDrive/Desktop/Claire NBW thesis/data/sampling_period.csv", row.names = FALSE)
+
+
+```
+
+```{r}
+
+# Rename 'Year' to 'year' in final_table if necessary
+#setnames(final_table, old = "Year", new = "year")
+
+# Ensure 'year' columns are numeric in both tables
+final_table[, year := as.numeric(year)]
+sampling_period[, year := as.numeric(year)]
+
+# Perform the merge
+glm_data_2 <- merge(
+  final_table,
+  sampling_period[, .(Title, year, numDaysByYear)],  # Select relevant columns
+  by = c("Title", "year"),
+  all.x = TRUE
+)
+
+# Check for missing values in the merged column
+if (any(is.na(glm_data_2$numDaysByYear))) {
+  warning("Some rows in glm_data_2 are missing numDaysByYear. Verify the merge.")
+}
+
+# Filter glm_data_2 to keep only Titles that appear more than 3 times
+#glm_data_2 <- glm_data_2[, if(.N > 3) .SD, by = Title]
+
+
+# View the resulting data frame
+head(glm_data_2)
+ 
+```
+
+
+SECOND GLM
+ADDED RANDOM EFFECTS
+Number of social partners ~ age class + sex class+ additional predictor for # of sampling periods
+
+```{r}
+# Load necessary libraries
+library(data.table)
+library(glmmTMB)  # Supports random effects
+library(MASS)  # For Negative Binomial models
+library(ggplot2)
+
+# Ensure glm_data_2 is a data.table
+setDT(glm_data_2)
+
+# Convert categorical variables to factors
+glm_data_2[, Age_Class := as.factor(Age_Class)]
+glm_data_2[, Sex := as.factor(Sex)]
+glm_data_2[, Title := as.factor(Title)]
+glm_data_2[, year := as.factor(year)]
+
+glm_data_2 <- glm_data_2[!is.na(Sex)]
+
+# Step 2: **Filter out Juvenile Males**
+glm_data_filtered <- glm_data_2[!(Age_Class == "Juvenile" & Sex == "Male")]
+
+# **Reconvert categorical variables to factors after filtering**
+glm_data_filtered[, Age_Class := as.factor(Age_Class)]
+glm_data_filtered[, Sex := as.factor(Sex)]
+glm_data_filtered[, Title := as.factor(Title)]
+glm_data_filtered[, year := as.factor(year)]
+
+# **Check factor levels before running the model**
+cat("Levels of Age_Class:", levels(glm_data_filtered$Age_Class), "\n")
+cat("Levels of Sex:", levels(glm_data_filtered$Sex), "\n")
+cat("Unique Titles:", length(unique(glm_data_filtered$Title)), "\n")
+cat("Unique Years:", length(unique(glm_data_filtered$Year)), "\n")
+
+# **Skip model fitting if any factor has only one level**
+if (length(unique(glm_data_filtered$Age_Class)) < 2 |
+    length(unique(glm_data_filtered$Sex)) < 2 |
+    length(unique(glm_data_filtered$Title)) < 2 |
+    length(unique(glm_data_filtered$year)) < 2) {
+  
+  stop("Not enough variation in categorical variables to fit the model.")
+}
+
+# Step 3: Fit the Poisson GLMM with random effects
+glm_model_3 <- glmmTMB(
+  Degree ~ Age_Class + Sex + numDaysByYear + (1 | Title) + (1 | year),
+  data = glm_data_filtered,
+  family = poisson(link = "log")
+)
+
+# Step 4: Check for overdispersion
+dispersion_test <- sum(residuals(glm_model_3, type = "pearson")^2) / df.residual(glm_model_3)
+cat("Dispersion test value:", dispersion_test, "\n")
+
+# If overdispersion is detected, refit with Negative Binomial Regression
+if (dispersion_test > 1.2) {
+  cat("Overdispersion detected. Refitting with Negative Binomial Regression...\n")
+  glm_model_nb_2 <- glmmTMB(
+    Degree ~ Age_Class + Sex + numDaysByYear + (1 | Title) + (1 | year),
+    data = glm_data_filtered,
+    family = nbinom2(link = "log")  # Negative Binomial
+  )
+  summary(glm_model_nb_2)
+}
+
+
+
+# Step 5: Save the models
+saveRDS(glm_model_3, "glm_social_partners_filtered.rds")
+if (exists("glm_model_nb_2")) saveRDS(glm_model_nb_2, "glm_social_partners_nb_filtered.rds")
+
+# Step 6: Export the filtered dataset for review
+write.csv(glm_data_filtered, "glm_data_2_social_partners_filtered.csv", row.names = FALSE)
+
+cat("GLM analysis with Age_Class, Sex, and Sampling Periods completed successfully.\n")
+
+```
+
+
+```{r}
+library(sjPlot)
+library(ggplot2)
+
+# Generate the prediction plots from glm_model_3 (without data points)
+sj_glm_3_nd <- plot_model(glm_model_3, type = "pred", show.data = FALSE)
+
+# Create a function to modify each plot's layers so that any linetype is set to "solid"
+modify_plot <- function(p) {
+  for (i in seq_along(p$layers)) {
+    # Check if the layer has a linetype parameter set in its aes_params
+    if (!is.null(p$layers[[i]]$aes_params$linetype)) {
+      p$layers[[i]]$aes_params$linetype <- "solid"
+    }
+  }
+  # Remove the x-axis title and overall plot title
+  p + labs(x = NULL) + theme(plot.title = element_blank())
+}
+
+# If the output is a list, apply modifications to each plot; otherwise, modify the single plot.
+if (is.list(sj_glm_3_nd)) {
+  sj_glm_3_nd <- lapply(sj_glm_3_nd, modify_plot)
+} else if (inherits(sj_glm_3_nd, "ggplot")) {
+  sj_glm_3_nd <- modify_plot(sj_glm_3_nd)
+}
+
+# Print all modified plots
+invisible(lapply(sj_glm_3_nd, print))
+
+
+
+```
+
+
+```{r}
+# Load necessary library
+library(data.table)
+
+# Create an empty dataset for storing results
+final_results_6 <- data.table(Individual = character(), Year = integer(), Prop_Female = numeric())
+
+# Extract list of unique individuals from columns A and B (Remove NAs)
+individuals_to_loop_through <- unique(na.omit(c(final_results_4$A, final_results_4$B)))
+
+# Extract list of unique years
+years_to_loop_through <- unique(final_results_4$Year)
+
+# Loop through each year and individual
+for (y in years_to_loop_through) {
+  for (ind in individuals_to_loop_through) {
+    
+    # Subset data where the individual appears in either A or B for the given year
+    temp_subset <- final_results_4[(A == ind | B == ind) & Year == y, ]
+
+    # Skip if no relevant data found
+    if (nrow(temp_subset) == 0) next
+
+    # Identify the sex of the partner (non-focal individual)
+    temp_subset[, partner_sex := ifelse(A == ind, B_sex, A_sex)]
+
+    # Filter out only female partners
+    female_partners_only <- temp_subset[partner_sex == "FemaleJ", ]
+
+    # Total HWI for all partners (avoiding NA issues)
+    total_HWI <- sum(temp_subset$HWI, na.rm = TRUE)
+    
+    # Sum HWI values for female partners
+    sum_HWI_female <- sum(female_partners_only$HWI, na.rm = TRUE)
+    
+    # Calculate proportion of HWI with female partners (normalized)
+    ind_prop_Female <- ifelse(total_HWI > 0, sum_HWI_female / total_HWI, 0)
+
+    # Append results to final_results_6 (only if total_HWI > 0 to avoid unnecessary rows)
+    if (total_HWI > 0) {
+      final_results_6 <- rbind(final_results_6, data.table(Individual = ind, Year = y, Prop_Female = ind_prop_Female), use.names = TRUE, fill = TRUE)
+    }
+  }
+}
+
+# Remove any accidental duplicates
+final_results_6 <- unique(final_results_6)
+
+# View the new dataset
+print(final_results_6)
+
+# Save the dataset
+write.csv(final_results_6, "final_results_6.csv", row.names = FALSE)
+
+```
+
+```{r}
+# Load necessary library
+library(data.table)
+
+# Ensure ID_sex_age is a data.table
+setDT(ID_sex_age)
+
+# Rename "Title" to "Individual"
+setnames(ID_sex_age, old = "Title", new = "Individual")
+
+# View updated dataset
+print(ID_sex_age)
+
+# Now proceed with merging
+setDT(final_results_6)
+
+# Merge datasets on "Individual" and "Year"
+final_glm <- merge(final_results_6, ID_sex_age, by = c("Individual", "Year"), all.x = TRUE)
+
+# Check for missing values
+missing_vals <- sum(is.na(final_glm))
+cat("Number of missing values after merging:", missing_vals, "\n")
+
+# Filter final_glm to only include Individuals that appear more than 3 times
+#final_glm <- final_glm[, if (.N > 3) .SD, by = Individual]
+
+# View the filtered merged dataset
+print(final_glm)
+
+# Save the merged dataset
+write.csv(final_glm, "final_glm.csv", row.names = FALSE)
+
+
+```
+
+FINAL GLM
+
+```{r}
+# Load necessary libraries
+library(data.table)
+library(glmmTMB)
+
+# Ensure final_glm is a data.table
+setDT(final_glm)
+
+# Convert categorical variables to factors
+final_glm[, Age_Class := as.factor(Age_Class)]
+final_glm[, Year := as.factor(Year)]
+final_glm[, Individual := as.factor(Individual)]
+
+# Check the structure of the dataset
+str(final_glm)
+
+# Step 1: Fit a Beta Regression Model (if Prop_Female is between 0 and 1)
+if (all(final_glm$Prop_Female >= 0 & final_glm$Prop_Female <= 1)) {
+  
+  # Adjust zero and one values for beta regression
+  epsilon <- 1e-6  
+  final_glm[Prop_Female == 1, Prop_Female := 1 - epsilon]  
+  final_glm[Prop_Female == 0, Prop_Female := 0 + epsilon]  
+
+  # Fit the Beta Regression Model with Random Effects
+  glm_model <- glmmTMB(
+    Prop_Female ~ Age_Class + (1 | Individual) + (1 | Year),
+    data = final_glm,
+    family = beta_family()
+  )
+
+} else {
+  # If Prop_Female is not between 0 and 1, fit a Gaussian model
+  glm_model <- glmmTMB(
+    Prop_Female ~ Age_Class + (1 | Individual) + (1 | Year),
+    data = final_glm,
+    family = gaussian(link = "identity")
+  )
+}
+
+# Step 2: Summarize the Model
+summary(glm_model)
+
+# Step 3: Save the Model
+saveRDS(glm_model, "glm_prop_female_age_class.rds")
+
+# Step 4: Export the Dataset for Review
+write.csv(final_glm, "final_glm_prop_female_age_class.csv", row.names = FALSE)
+
+cat("GLM analysis completed successfully.\n")
+
+
+
+
+```
+
+
+```{r}
+library(sjPlot)
+library(ggplot2)
+library(scales)  # for squish()
+
+# Generate the prediction plot
+sj_glm_model <- plot_model(glm_model, type = "pred", jitter = TRUE, show.data = TRUE)
+
+# Force every layer that uses a linetype to be "solid"
+for(i in seq_along(sj_glm_model$layers)) {
+  if(!is.null(sj_glm_model$layers[[i]]$aes_params$linetype)) {
+    sj_glm_model$layers[[i]]$aes_params$linetype <- "solid"
+  }
+}
+
+# Remove the x-axis title and plot title, set the y-axis title,
+# and ensure the y-axis is bounded between 0 and 1 (squishing out-of-bound values)
+sj_glm_model <- sj_glm_model +
+  labs(x = NULL, y = "Proportion of Female Network Strength") +
+  theme(plot.title = element_blank()) +
+  scale_y_continuous(limits = c(0, 1), oob = squish)
+
+# Print the modified plot
+print(sj_glm_model)
+
+
+```
+
+
+
+
+
+
+DETERMINING ASSOCIATES FOR EACH CALF
+
+```{r}
+library(data.table)
+
+# 0. Convert A and B to character to avoid factor-level conflicts
+final_results_4[, A := as.character(A)]
+final_results_4[, B := as.character(B)]
+
+# 1. Filter to only rows that contain a calf in dyadic_age
+calf_rows <- final_results_4[dyadic_age %like% "Calf"]
+
+# 2. Identify which side is the calf (CalfID) vs. the associate (AssociateID)
+#    This approach assumes exactly one side is a calf. 
+#    If both are calves (Calf_Calf), you'll want special handling or a different logic.
+calf_rows[, CalfID := ifelse(A_age_class == "Calf", A, B)]
+calf_rows[, AssociateID := ifelse(A_age_class == "Calf", B, A)]
+
+# 3. Extract the Calf’s and Associate’s Age and Sex
+calf_rows[, CalfAge := ifelse(CalfID == A, A_age_class, B_age_class)]
+calf_rows[, CalfSex := ifelse(CalfID == A, A_sex, B_sex)]
+calf_rows[, AssociateAge := ifelse(CalfID == A, B_age_class, A_age_class)]
+calf_rows[, AssociateSex := ifelse(CalfID == A, B_sex, A_sex)]
+
+# 4. Summarize by (CalfID, AssociateID, AssociateAge, AssociateSex)
+summary_table <- calf_rows[
+  , .(
+    NumAssociations = .N  # or sum(HWI) if you want to sum an index
+  ),
+  by = .(CalfID, AssociateID, AssociateAge, AssociateSex)
+]
+
+# Sort by CalfID and descending number of associations
+setorder(summary_table, CalfID, -NumAssociations)
+
+# 5. View the summary table
+summary_table
+
+
+```
+
+```{r}
+#  summary_table has columns:
+# CalfID, AssociateID, AssociateAge, AssociateSex, NumAssociations
+
+# 1. Group by CalfID, AssociateSex, and AssociateAge to count total associations
+associate_summary <- summary_table[
+  , .(NumAssociates = sum(NumAssociations)), 
+  by = .(CalfID, AssociateSex, AssociateAge)
+]
+
+# Print the summarized table (long format)
+print(associate_summary)
+
+# 2. (Optional) Pivot the summary table to a wide format so that each row is a CalfID
+#    and columns are combinations of AssociateSex and AssociateAge
+#    For example, if AssociateSex has levels "Male" and "FemaleJ" and AssociateAge has levels "Adult", "Calf", "Juvenile"
+associate_summary_wide <- dcast(
+  associate_summary, 
+  CalfID ~ AssociateSex + AssociateAge, 
+  value.var = "NumAssociates", 
+  fill = 0
+)
+
+# Print the wide-format summary table
+print(associate_summary_wide)
+
+
+
+
+```
+
+top HWI is it male or female for each calf
+dif b/w first and second-large or small
